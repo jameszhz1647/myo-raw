@@ -1,3 +1,21 @@
+# https://github.com/dzhu/myo-raw/issues/8
+
+'''
+	Original by dzhu
+		https://github.com/dzhu/myo-raw
+
+	Edited by Fernando Cosentino
+        http://www.fernandocosentino.net/pyoconnect
+
+    Edited by Alvaro Villoslada (Alvipe)
+        https://github.com/Alvipe/myo-raw
+
+    Edited by Robert Schloen
+        https://github.com/rschloen/semg_control/tree/b76d0fc9b0583eb0f954d9bbf23f4af748efa498
+
+    Edited by Sonia Yuxiao Lai
+'''
+
 from __future__ import print_function
 
 import enum
@@ -6,7 +24,7 @@ import struct
 import sys
 import threading
 import time
-
+import csv
 import serial
 from serial.tools.list_ports import comports
 
@@ -192,7 +210,7 @@ class MyoRaw(object):
         return None
 
     def run(self, timeout=None):
-        self.bt.recv_packet(timeout)
+        return self.bt.recv_packet(timeout) 
 
     def connect(self):
         ## stop everything from before
@@ -229,6 +247,7 @@ class MyoRaw(object):
             ## don't know what these do; Myo Connect sends them, though we get data
             ## fine without them
             self.write_attr(0x19, b'\x01\x02\x00\x00')
+            # Subscribe for notifications from 4 EMG data channels
             self.write_attr(0x2f, b'\x01\x00')
             self.write_attr(0x2c, b'\x01\x00')
             self.write_attr(0x32, b'\x01\x00')
@@ -266,36 +285,55 @@ class MyoRaw(object):
             # self.write_attr(0x19, b'\x01\x03\x00\x01\x01')
             self.start_raw()
 
-        ## add data handlers
+        # add data handlers
         def handle_data(p):
-            if (p.cls, p.cmd) != (4, 5): return
+            if (p.cls, p.cmd) != (4, 5):
+                return
 
             c, attr, typ = unpack('BHB', p.payload[:4])
             pay = p.payload[5:]
 
             if attr == 0x27:
+                # Unpack a 17 byte array, first 16 are 8 unsigned shorts, last one an unsigned char
                 vals = unpack('8HB', pay)
-                ## not entirely sure what the last byte is, but it's a bitmask that
-                ## seems to indicate which sensors think they're being moved around or
-                ## something
+                # not entirely sure what the last byte is, but it's a bitmask that
+                # seems to indicate which sensors think they're being moved around or
+                # something
                 emg = vals[:8]
                 moving = vals[8]
                 self.on_emg(emg, moving)
+            # Read notification handles corresponding to the for EMG characteristics
+            elif attr == 0x2b or attr == 0x2e or attr == 0x31 or attr == 0x34:
+                '''According to http://developerblog.myo.com/myocraft-emg-in-the-bluetooth-protocol/
+                each characteristic sends two secuential readings in each update,
+                so the received payload is split in two samples. According to the
+                Myo BLE specification, the data type of the EMG samples is int8_t.
+                '''
+                emg1 = struct.unpack('<8b', pay[:8])
+                emg2 = struct.unpack('<8b', pay[8:])
+                self.on_emg(emg1, 0)
+                self.on_emg(emg2, 0)
+            # Read IMU characteristic handle
             elif attr == 0x1c:
                 vals = unpack('10h', pay)
                 quat = vals[:4]
                 acc = vals[4:7]
                 gyro = vals[7:10]
                 self.on_imu(quat, acc, gyro)
+            # Read classifier characteristic handle
             elif attr == 0x23:
-                typ, val, xdir = unpack('3B', pay)
+                typ, val, xdir, _, _, _ = unpack('6B', pay)
 
-                if typ == 1: # on arm
+                if typ == 1:  # on arm
                     self.on_arm(Arm(val), XDirection(xdir))
-                elif typ == 2: # removed from arm
+                elif typ == 2:  # removed from arm
                     self.on_arm(Arm.UNKNOWN, XDirection.UNKNOWN)
-                elif typ == 3: # pose
+                elif typ == 3:  # pose
                     self.on_pose(Pose(val))
+            # Read battery characteristic handle
+            elif attr == 0x11:
+                battery_level = ord(pay)
+                self.on_battery(battery_level)
             else:
                 print('data with unknown attr: %02X %s' % (attr, p))
 
@@ -316,13 +354,46 @@ class MyoRaw(object):
             self.bt.disconnect(self.conn)
 
     def start_raw(self):
+        ''' To get raw EMG signals, we subscribe to the four EMG notification
+        characteristics by writing a 0x0100 command to the corresponding handles.
+        '''
+        self.write_attr(0x2c, b'\x01\x00')  # Suscribe to EmgData0Characteristic
+        self.write_attr(0x2f, b'\x01\x00')  # Suscribe to EmgData1Characteristic
+        self.write_attr(0x32, b'\x01\x00')  # Suscribe to EmgData2Characteristic
+        self.write_attr(0x35, b'\x01\x00')  # Suscribe to EmgData3Characteristic
+
+        '''Bytes sent to handle 0x19 (command characteristic) have the following
+        format: [command, payload_size, EMG mode, IMU mode, classifier mode]
+        According to the Myo BLE specification, the commands are:
+            0x01 -> set EMG and IMU
+            0x03 -> 3 bytes of payload
+            0x02 -> send 50Hz filtered signals
+            0x01 -> send IMU data streams
+            0x01 -> send classifier events
+        '''
+        self.write_attr(0x19, b'\x01\x03\x02\x01\x01')
+
         '''Sending this sequence for v1.0 firmware seems to enable both raw data and
         pose notifications.
         '''
 
-        self.write_attr(0x28, b'\x01\x00')
-        self.write_attr(0x19, b'\x01\x03\x01\x01\x00')
-        self.write_attr(0x19, b'\x01\x03\x01\x01\x01')
+        '''By writting a 0x0100 command to handle 0x28, some kind of "hidden" EMG
+        notification characteristic is activated. This characteristic is not
+        listed on the Myo services of the offical BLE specification from Thalmic
+        Labs. Also, in the second line where we tell the Myo to enable EMG and
+        IMU data streams and classifier events, the 0x01 command wich corresponds
+        to the EMG mode is not listed on the myohw_emg_mode_t struct of the Myo
+        BLE specification.
+        These two lines, besides enabling the IMU and the classifier, enable the
+        transmission of a stream of low-pass filtered EMG signals from the eight
+        sensor pods of the Myo armband (the "hidden" mode I mentioned above).
+        Instead of getting the raw EMG signals, we get rectified and smoothed
+        signals, a measure of the amplitude of the EMG (which is useful to have
+        a measure of muscle strength, but are not as useful as a truly raw signal).
+        '''
+
+        # self.write_attr(0x28, b'\x01\x00')  # Not needed for raw signals
+        # self.write_attr(0x19, b'\x01\x03\x01\x01\x01')
 
     def mc_start_collection(self):
         '''Myo Connect sends this sequence (or a reordering) when starting data
@@ -330,18 +401,18 @@ class MyoRaw(object):
         pose notifications.
         '''
 
-        self.write_attr(0x28, b'\x01\x00')
-        self.write_attr(0x1d, b'\x01\x00')
-        self.write_attr(0x24, b'\x02\x00')
-        self.write_attr(0x19, b'\x01\x03\x01\x01\x01')
-        self.write_attr(0x28, b'\x01\x00')
-        self.write_attr(0x1d, b'\x01\x00')
-        self.write_attr(0x19, b'\x09\x01\x01\x00\x00')
-        self.write_attr(0x1d, b'\x01\x00')
-        self.write_attr(0x19, b'\x01\x03\x00\x01\x00')
-        self.write_attr(0x28, b'\x01\x00')
-        self.write_attr(0x1d, b'\x01\x00')
-        self.write_attr(0x19, b'\x01\x03\x01\x01\x00')
+        self.write_attr(0x28, b'\x01\x00')  # Suscribe to EMG notifications
+        self.write_attr(0x1d, b'\x01\x00')  # Suscribe to IMU notifications
+        self.write_attr(0x24, b'\x02\x00')  # Suscribe to classifier indications
+        self.write_attr(0x19, b'\x01\x03\x01\x01\x01')  # Set EMG and IMU, payload size = 3, EMG on, IMU on, classifier on
+        self.write_attr(0x28, b'\x01\x00')  # Suscribe to EMG notifications
+        self.write_attr(0x1d, b'\x01\x00')  # Suscribe to IMU notifications
+        self.write_attr(0x19, b'\x09\x01\x01\x00\x00')  # Set sleep mode, payload size = 1, never go to sleep, don't know, don't know
+        self.write_attr(0x1d, b'\x01\x00')  # Suscribe to IMU notifications
+        self.write_attr(0x19, b'\x01\x03\x00\x01\x00')  # Set EMG and IMU, payload size = 3, EMG off, IMU on, classifier off
+        self.write_attr(0x28, b'\x01\x00')  # Suscribe to EMG notifications
+        self.write_attr(0x1d, b'\x01\x00')  # Suscribe to IMU notifications
+        self.write_attr(0x19, b'\x01\x03\x01\x01\x00')  # Set EMG and IMU, payload size = 3, EMG on, IMU on, classifier off
 
     def mc_end_collection(self):
         '''Myo Connect sends this sequence (or a reordering) when ending data collection
@@ -411,69 +482,101 @@ if __name__ == '__main__':
         scr = pygame.display.set_mode((w, h))
 
     last_vals = None
-    def plot(scr, vals):
-        DRAW_LINES = False
+    with open('data/raw_emg.csv', mode='w+') as emg_file,  \
+        open('data/raw_imu.csv', mode='w+') as imu_file,   \
+        open('data/pose.csv',mode='w+') as pose_file:
+        emg_writer = csv.writer(emg_file, delimiter=',')
+        imu_writer = csv.writer(imu_file, delimiter=',')
+        pose_writer = csv.writer(pose_file, delimiter=',')
 
-        global last_vals
-        if last_vals is None:
+        def plot(scr, vals):
+            DRAW_LINES = True
+
+            global last_vals
+            if last_vals is None:
+                last_vals = vals
+                return
+
+            D = 5
+            scr.scroll(-D)
+            scr.fill((0,0,0), (w - D, 0, w, h))
+            for i, (u, v) in enumerate(zip(last_vals, vals)):
+                if DRAW_LINES:
+                    pygame.draw.line(scr, (0,255,0),
+                                    (w - D, int(h/8 * (i+1 - u))),
+                                    (w, int(h/8 * (i+1 - v))))
+                    pygame.draw.line(scr, (255,255,255),
+                                    (w - D, int(h/8 * (i+1))),
+                                    (w, int(h/8 * (i+1))))
+                else:
+                    c = int(255 * max(0, min(1, v)))
+                    scr.fill((c, c, c), (w - D, i * h / 8, D, (i + 1) * h / 8 - i * h / 8))
+
+            pygame.display.flip()
             last_vals = vals
-            return
 
-        D = 5
-        scr.scroll(-D)
-        scr.fill((0,0,0), (w - D, 0, w, h))
-        for i, (u, v) in enumerate(zip(last_vals, vals)):
-            if DRAW_LINES:
-                pygame.draw.line(scr, (0,255,0),
-                                 (w - D, int(h/8 * (i+1 - u))),
-                                 (w, int(h/8 * (i+1 - v))))
-                pygame.draw.line(scr, (255,255,255),
-                                 (w - D, int(h/8 * (i+1))),
-                                 (w, int(h/8 * (i+1))))
-            else:
-                c = int(255 * max(0, min(1, v)))
-                scr.fill((c, c, c), (w - D, i * h / 8, D, (i + 1) * h / 8 - i * h / 8));
+        m = MyoRaw(sys.argv[1] if len(sys.argv) >= 2 else None)
 
-        pygame.display.flip()
-        last_vals = vals
-
-    m = MyoRaw(sys.argv[1] if len(sys.argv) >= 2 else None)
-
-    def proc_emg(emg, moving, times=[]):
-        if HAVE_PYGAME:
-            ## update pygame display
-            plot(scr, [e / 2000. for e in emg])
-        else:
-            print(emg)
-
-        ## print framerate of received data
-        times.append(time.time())
-        if len(times) > 20:
-            #print((len(times) - 1) / (times[-1] - times[0]))
-            times.pop(0)
-
-    m.add_emg_handler(proc_emg)
-    m.connect()
-
-    m.add_arm_handler(lambda arm, xdir: print('arm', arm, 'xdir', xdir))
-    m.add_pose_handler(lambda p: print('pose', p))
-
-    try:
-        while True:
-            m.run(1)
-
+        def proc_emg(emg, moving, times=[]):
             if HAVE_PYGAME:
-                for ev in pygame.event.get():
-                    if ev.type == QUIT or (ev.type == KEYDOWN and ev.unicode == 'q'):
-                        raise KeyboardInterrupt()
-                    elif ev.type == KEYDOWN:
-                        if K_1 <= ev.key <= K_3:
-                            m.vibrate(ev.key - K_0)
-                        if K_KP1 <= ev.key <= K_KP3:
-                            m.vibrate(ev.key - K_KP0)
+                ## update pygame display
+                plot(scr, [e / 500. for e in emg])
 
-    except KeyboardInterrupt:
-        pass
-    finally:
-        m.disconnect()
-        print()
+                emg_writer.writerow([time.time(), *emg])
+                
+                pygame.event.pump()
+            else:
+                print(emg)
+
+            ## print framerate of received data
+            times.append(time.time())
+            if len(times) > 20:
+                #print((len(times) - 1) / (times[-1] - times[0]))
+                times.pop(0)
+        
+        def proc_imu(quat, acc, gyro):
+            if HAVE_PYGAME:
+                imu_writer.writerow([time.time(), *quat, *acc, *gyro])
+                pygame.event.pump()
+            else:
+                print(quat)
+
+
+        m.add_emg_handler(proc_emg)    
+        # m.add_pose_handler(lambda p: pose_writer.writerow((time.time(), p.name, p.value)))
+        m.add_pose_handler(lambda p: print(time.time(), p.name, p.value))
+        m.add_imu_handler(proc_imu)
+
+        m.connect()
+
+        m.add_arm_handler(lambda arm, xdir: print('arm', arm, 'xdir', xdir))
+
+        m.add_pose_handler(lambda p: print('pose', p))
+        
+        # m.add_imu_handler(lambda quat, acc, gyro: imu_writer.writerow(quat + acc + gyro))
+        # m.add_imu_handler(proc_imu)
+
+        try:
+            while True:
+                if m.run(1) is None:
+                    print("Connection lost, try to reconnect")
+                    m.connect()
+                else:
+                    if HAVE_PYGAME:
+                        for ev in pygame.event.get():
+                            if ev.type == QUIT or (ev.type == KEYDOWN and ev.unicode == 'q'):
+                                raise KeyboardInterrupt()
+                            elif ev.type == KEYDOWN:
+                                if K_1 <= ev.key <= K_3:
+                                    m.vibrate(ev.key - K_0)
+                                if K_KP1 <= ev.key <= K_KP3:
+                                    m.vibrate(ev.key - K_KP0)
+
+        except KeyboardInterrupt:
+            pass
+        finally:
+            m.disconnect()
+            emg_file.close()
+            imu_file.close()
+            pose_file.close()
+            print()
